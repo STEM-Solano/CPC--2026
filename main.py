@@ -146,7 +146,15 @@ class Button:
             rect=text.get_rect(center=(self.rect.centerx,start_y+i*25))
             screen.blit(text,rect)
     def clicked(self,event):
-        return event.type==pygame.MOUSEBUTTONDOWN and event.button==1 and self.rect.collidepoint(event.pos)
+        """Accept desktop mouse clicks and mobile touchscreen taps."""
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            return event.button == 1 and self.rect.collidepoint(event.pos)
+        if event.type == pygame.FINGERDOWN:
+            # Pygame finger coordinates are normalized to the range 0..1.
+            x = int(event.x * SCREEN_WIDTH)
+            y = int(event.y * SCREEN_HEIGHT)
+            return self.rect.collidepoint(x, y)
+        return False
 class Character:
     def __init__(self,hp,strength,defense,image):
         self.max_hp=hp
