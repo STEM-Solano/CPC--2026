@@ -2,12 +2,89 @@ import asyncio
 import pygame
 import sys
 import random
+import os
 pygame.init()
+# iOS may not expose audio until the first user interaction.
+try:
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
+    AUDIO_AVAILABLE = True
+except (pygame.error, OSError):
+    AUDIO_AVAILABLE = False
 SCREEN_WIDTH=800
 SCREEN_HEIGHT=600
 screen=pygame.display.set_mode((SCREEN_WIDTH,SCREEN_HEIGHT))
 pygame.display.set_caption("Trials and Trolls")
 clock=pygame.time.Clock()
+current_music=None
+music_sounds={}
+music_channel=pygame.mixer.Channel(0) if AUDIO_AVAILABLE else None
+music_transition=None
+encounter_transition=None
+MUSIC_VOLUME=0.5
+MUSIC_FADE_MS=1200
+def play_enemy_music(enemy_number):
+    global current_music,music_transition
+    if not AUDIO_AVAILABLE:
+        return
+    filename=f"music/{enemy_number+1}.wav"
+    if current_music==filename and music_transition is None:
+        return
+    music_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),filename)
+    try:
+        if filename not in music_sounds:
+            music_sounds[filename]=pygame.mixer.Sound(music_path)
+        if music_transition:
+            # Replace the queued track if the player reaches another fight mid-transition.
+            music_transition["next_filename"]=filename
+            if music_transition["phase"]=="in":
+                music_transition={"phase":"out","next_filename":filename,"start_time":pygame.time.get_ticks(),"start_volume":music_channel.get_volume()}
+                music_channel.fadeout(MUSIC_FADE_MS)
+            return
+        if current_music is None or not music_channel.get_busy():
+            music_channel.stop()
+            music_channel.set_volume(0)
+            music_channel.play(music_sounds[filename],loops=-1)
+            current_music=filename
+            music_transition={"phase":"in","next_filename":filename,"start_time":pygame.time.get_ticks(),"start_volume":0}
+        else:
+            # Fade the current track completely out before starting the next one.
+            music_transition={"phase":"out","next_filename":filename,"start_time":pygame.time.get_ticks(),"start_volume":music_channel.get_volume()}
+            music_channel.fadeout(MUSIC_FADE_MS)
+    except (pygame.error,OSError) as error:
+        music_transition=None
+        print(f"Could not play {filename}: {error}")
+def update_music_transition():
+    global current_music,music_transition
+    if not AUDIO_AVAILABLE or not music_transition:
+        return
+    now=pygame.time.get_ticks()
+    elapsed=now-music_transition["start_time"]
+    progress=min(1,elapsed/MUSIC_FADE_MS)
+    if music_transition["phase"]=="out":
+        # No new track starts until the old one has fully faded away.
+        if progress>=1:
+            filename=music_transition["next_filename"]
+            try:
+                music_channel.stop()
+                music_channel.set_volume(0)
+                music_channel.play(music_sounds[filename],loops=-1)
+                current_music=filename
+                music_transition={"phase":"in","next_filename":filename,"start_time":now,"start_volume":0}
+            except pygame.error as error:
+                music_transition=None
+                print(f"Could not start {filename}: {error}")
+    elif music_transition["phase"]=="in":
+        music_channel.set_volume(MUSIC_VOLUME*progress)
+        if progress>=1:
+            music_channel.set_volume(MUSIC_VOLUME)
+            music_transition=None
+def stop_music():
+    global current_music,music_transition
+    if music_channel is not None:
+        music_channel.stop()
+    current_music=None
+    music_transition=None
 WHITE=(255,255,255)
 BLACK=(0,0,0)
 RED=(220,50,50)
@@ -28,108 +105,191 @@ ATTACK_NAMES={
     "Troll King":["Club Smash","Earthquake","Royal Slam"]
 }
 QUESTIONS={}
+selected_grade=5
+def make_answer_choices(answer):
+    """Create four distinct choices for numeric or symbolic answers."""
+    answer_text=str(answer)
+    choices={answer_text}
+    try:
+        number=float(answer_text)
+        if number.is_integer():
+            number=int(number)
+        spread=max(2,int(abs(number)*0.2))
+        attempts=0
+        while len(choices)<4 and attempts<100:
+            attempts+=1
+            wrong=number+random.randint(-spread,spread)
+            if isinstance(number,int) or float(wrong).is_integer():
+                wrong=int(wrong)
+            if str(wrong)!=answer_text:
+                choices.add(str(wrong))
+        fallback=1
+        while len(choices)<4:
+            choices.add(str(number+spread+fallback))
+            fallback+=1
+    except (ValueError,TypeError):
+        # For answers such as x^2, sin(x), or 1/2, use plausible alternatives.
+        alternatives=[f"{answer_text} + 1",f"{answer_text} - 1",f"2({answer_text})",f"-{answer_text}"]
+        random.shuffle(alternatives)
+        for option in alternatives:
+            if len(choices)>=4:
+                break
+            choices.add(option)
+    choices=list(choices)
+    random.shuffle(choices)
+    return choices,choices.index(answer_text)
+def generate_one_question(grade):
+    """Generate a question from the selected grade's actual math curriculum."""
+    def whole(low,high):
+        return random.randint(low,high)
+    if grade==1:
+        a,b=whole(0,10),whole(0,10)
+        if random.choice([True,False]):
+            return f"What is {a} + {b}?",a+b
+        a=whole(0,10); b=whole(0,a)
+        return f"What is {a} - {b}?",a-b
+    if grade==2:
+        kind=random.choice(["add","subtract","multiply","place"])
+        if kind=="add":
+            a,b=whole(10,99),whole(1,99); return f"What is {a} + {b}?",a+b
+        if kind=="subtract":
+            a,b=whole(10,99),whole(1,99); a,b=max(a,b),min(a,b); return f"What is {a} - {b}?",a-b
+        if kind=="multiply":
+            a,b=whole(2,5),whole(2,10); return f"What is {a} × {b}?",a*b
+        digit=whole(1,9); number=digit*10; return f"In {number}, what is the value of the {digit} in the tens place?",number
+    if grade==3:
+        kind=random.choice(["multiply","divide","fraction","round"])
+        if kind=="multiply":
+            a,b=whole(2,12),whole(2,12); return f"What is {a} × {b}?",a*b
+        if kind=="divide":
+            b=whole(2,12); q=whole(2,12); return f"What is {b*q} ÷ {b}?",q
+        if kind=="fraction":
+            d=random.choice([2,3,4,5,6,8]); n=whole(1,d-1); return f"What fraction of {d} equal parts is {n} part(s)?",f"{n}/{d}"
+        n=whole(10,999); return f"Round {n} to the nearest ten.",round(n,-1)
+    if grade==4:
+        kind=random.choice(["multiply","divide","fraction","perimeter","decimal"])
+        if kind=="multiply":
+            a,b=whole(12,99),whole(2,9); return f"What is {a} × {b}?",a*b
+        if kind=="divide":
+            b=whole(2,12); q=whole(10,99); return f"What is {b*q} ÷ {b}?",q
+        if kind=="fraction":
+            d=random.choice([4,6,8,10,12]); n=whole(1,d-1); return f"Simplify {n*2}/{d*2}.",f"{n}/{d}"
+        if kind=="perimeter":
+            a,b=whole(2,20),whole(2,20); return f"A rectangle is {a} cm by {b} cm. What is its perimeter?",2*(a+b)
+        a,b=whole(1,9),whole(1,9); return f"What is {a/10:.1f} + {b/10:.1f}?",f"{(a+b)/10:.1f}"
+    if grade==5:
+        kind=random.choice(["fraction","decimal","percent","area","order"])
+        if kind=="fraction":
+            d=random.choice([2,3,4,5,6,8,10]); n=whole(1,d-1); return f"What is {n}/{d} + {d-n}/{d}?",1
+        if kind=="decimal":
+            a,b=whole(10,999)/100,whole(10,999)/100; return f"What is {a:.2f} + {b:.2f}?",f"{a+b:.2f}"
+        if kind=="percent":
+            pct=random.choice([10,20,25,50,75]); n=random.choice([20,40,60,80,100,200]); return f"What is {pct}% of {n}?",pct*n//100
+        if kind=="area":
+            a,b=whole(2,20),whole(2,20); return f"A rectangle is {a} by {b}. What is its area?",a*b
+        return f"What is 6 + 3 × 4?",18
+    if grade==6:
+        kind=random.choice(["fraction","negative","ratio","decimal","expression"])
+        if kind=="fraction":
+            d=random.choice([2,3,4,5,6,8,10]); n=whole(1,d-1); return f"What is {n}/{d} + {d-n}/{d}?",1
+        if kind=="negative":
+            a,b=whole(-15,15),whole(-15,15); op=random.choice(["+","-"]); ans=a+b if op=="+" else a-b; return f"What is {a} {op} ({b})?",ans
+        if kind=="ratio":
+            a,b,k=whole(1,6),whole(1,6),whole(2,8); return f"A ratio is {a}:{b}. If both parts are multiplied by {k}, what is the new second part?",b*k
+        if kind=="decimal":
+            a,b=whole(10,999)/10,whole(10,999)/10; return f"What is {a:.1f} - {b:.1f}?",f"{a-b:.1f}"
+        x=whole(1,15); b=whole(1,20); return f"If x = {x}, what is 3x + {b}?",3*x+b
+    if grade==7:
+        kind=random.choice(["proportion","percent","integer","equation","probability"])
+        if kind=="proportion":
+            a,b,k=whole(2,12),whole(2,12),whole(2,10); return f"If {a}/{b} = x/{b*k}, what is x?",a*k
+        if kind=="percent":
+            pct=random.choice([5,10,15,20,25,30,40,50]); n=whole(2,20)*10; return f"What is {pct}% of {n}?",pct*n/100
+        if kind=="integer":
+            a,b=whole(-30,30),whole(-30,30); return f"What is ({a}) × ({b})?",a*b
+        if kind=="equation":
+            x=whole(-10,20); b=whole(-10,20); return f"Solve: x + ({b}) = {x+b}",x
+        a,b=whole(1,6),whole(2,10); return f"A bag has {a} red and {b} blue marbles. What is P(red)?",f"{a}/{a+b}"
+    if grade==8:
+        kind=random.choice(["linear","exponent","slope","pythagorean","scientific"])
+        if kind=="linear":
+            x=whole(-10,15); a=whole(2,8); b=whole(-15,15); return f"Solve: {a}x + ({b}) = {a*x+b}",x
+        if kind=="exponent":
+            a=whole(2,6); b=whole(2,4); return f"What is {a}^{b}?",a**b
+        if kind=="slope":
+            x1,y1,x2,y2=whole(-5,5),whole(-5,5),whole(1,8),whole(1,8); x2+=x1; y2+=y1; dx=x2-x1; dy=y2-y1; from math import gcd; g=gcd(abs(dy),abs(dx)); return f"Find the slope through ({x1}, {y1}) and ({x2}, {y2}).",f"{dy//g}/{dx//g}" if dx else 0
+        if kind=="pythagorean":
+            a,b=random.choice([(3,4),(5,12),(8,15),(6,8)]); return f"A right triangle has legs {a} and {b}. Find the hypotenuse.",int((a*a+b*b)**0.5)
+        a=whole(1,9); return f"Write {a*1000} in scientific notation.",f"{a} × 10^3"
+    if grade==9:
+        kind=random.choice(["equation","slope","system","polynomial","function"])
+        if kind=="equation":
+            x=whole(-10,15); a=whole(2,8); b=whole(-20,20); return f"Solve: {a}x + {b} = {a*x+b}",x
+        if kind=="slope":
+            m=whole(-8,8); b=whole(-10,10); return f"For y = {m}x + {b}, what is the slope?",m
+        if kind=="system":
+            x,y=whole(-5,8),whole(-5,8); return f"Solve the system: x + y = {x+y}; x - y = {x-y}. What is x?",x
+        if kind=="polynomial":
+            a,b=whole(1,8),whole(1,8); return f"Expand (x + {a})(x + {b}). What is the constant term?",a*b
+        x=whole(-5,5); return f"If f(x) = 2x² + 1, find f({x}).",2*x*x+1
+    if grade==10:
+        kind=random.choice(["quadratic","radical","geometry","trig","function"])
+        if kind=="quadratic":
+            r1,r2=whole(-6,6),whole(-6,6); return f"For x² - ({r1+r2})x + ({r1*r2}) = 0, what is the sum of the roots?",r1+r2
+        if kind=="radical":
+            n=whole(2,15); return f"Simplify √{n*n}.",n
+        if kind=="geometry":
+            r=whole(2,10); return f"What is the area of a circle with radius {r}? (Use π.)",f"{r*r}π"
+        if kind=="trig":
+            return random.choice([( "What is sin(30°)?","1/2"),("What is cos(60°)?","1/2"),("What is tan(45°)?","1")])
+        x=whole(-5,5); return f"If f(x) = x² - 3, find f({x}).",x*x-3
+    if grade==11:
+        kind=random.choice(["log","trig","sequence","complex","function"])
+        if kind=="log":
+            base=random.choice([2,3,10]); power=whole(1,5); return f"Evaluate log base {base} of {base**power}.",power
+        if kind=="trig":
+            return random.choice([("What is sin(90°)?","1"),("What is cos(0°)?","1"),("What is sin(0°)?","0"),("What is cos(180°)?","-1")])
+        if kind=="sequence":
+            a,d=whole(-10,20),whole(2,8); return f"An arithmetic sequence starts {a}, {a+d}, {a+2*d}. What is the 10th term?",a+9*d
+        if kind=="complex":
+            a,b=whole(1,8),whole(1,8); return f"What is ({a} + {b}i) + ({a} - {b}i)?",2*a
+        x=whole(-5,5); return f"If f(x) = 3x² - 2x, find f({x}).",3*x*x-2*x
+    # Grade 12: limits, derivatives, integrals, advanced algebra and calculus.
+    kind=random.choice(["derivative","power_rule","integral","limit","logarithm","complex"])
+    if kind=="derivative":
+        a=whole(1,8); n=whole(2,6); return f"If f(x) = {a}x^{n}, what is f'(x)?",f"{a*n}x^{n-1}"
+    if kind=="power_rule":
+        a=whole(1,6); n=whole(2,5); return f"Differentiate {a}x^{n}.",f"{a*n}x^{n-1}"
+    if kind=="integral":
+        a=whole(1,8); n=whole(1,5); return f"Find ∫ {a}x^{n} dx.",f"{a}/{n+1}x^{n+1} + C"
+    if kind=="limit":
+        a=whole(1,8); return f"Evaluate lim (x→{a}) of (x² - {a*a})/(x - {a}).",2*a
+    if kind=="logarithm":
+        power=whole(1,5); return f"Evaluate log₁₀(10^{power}).",power
+    a,b=whole(1,8),whole(1,8); return f"What is ({a}+{b}i)({a}-{b}i)?",a*a+b*b
 def generate_question_bank(difficulty,subject):
-    ranges={"easy":(1,10),"normal":(5,25),"hard":(10,50),"very_hard":(20,100)}
-    low,high=ranges[difficulty]
+    # Attack choice changes the question pool, while the selected grade sets the curriculum.
     bank=[]
     seen=set()
-    while len(bank)<15:
-        if subject=="addition":
-            a=random.randint(low,high)
-            b=random.randint(low,high)
-            answer=a+b
-            text=f"What is {a} + {b}?"
-        elif subject=="multiplication":
-            if difficulty=="very_hard":
-                a=random.randint(6,15)
-                b=random.randint(6,15)
-            else:
-                a=random.randint(max(2,low//2),max(3,high//3))
-                b=random.randint(max(2,low//2),max(3,high//3))
-            answer=a*b
-            text=f"What is {a} × {b}?"
-        elif subject=="division":
-            divisor=random.randint(max(2,low//3),max(3,high//5))
-            quotient=random.randint(max(2,low),max(4,high//2))
-            dividend=divisor*quotient
-            answer=quotient
-            text=f"What is {dividend} ÷ {divisor}?"
-        elif subject=="algebra":
-            x=random.randint(max(2,low),max(5,high//2))
-            a=random.randint(1,5 if difficulty in ["easy","normal"] else 10)
-            b=random.randint(1,10 if difficulty=="easy" else 25)
-            form=random.randint(0,2)
-            if form==0:
-                answer=x
-                total=x+b
-                text=f"x + {b} = {total}. What is x?"
-            elif form==1:
-                total=x-b
-                if total<0:
-                    total=x+b
-                    text=f"x + {b} = {total}. What is x?"
-                else:
-                    answer=x
-                    text=f"x - {b} = {total}. What is x?"
-            else:
-                answer=x
-                total=a*x+b
-                text=f"{a}x + {b} = {total}. What is x?"
-        else:
-            if difficulty=="easy":
-                start_num=random.randint(1,10)
-                step=random.randint(1,5)
-                nums=[start_num+i*step for i in range(4)]
-                answer=nums[-1]+step
-            elif difficulty=="normal":
-                start_num=random.randint(1,15)
-                if random.choice([True,False]):
-                    step=random.randint(2,8)
-                    nums=[start_num+i*step for i in range(4)]
-                    answer=nums[-1]+step
-                else:
-                    start_num=random.randint(1,5)
-                    nums=[start_num*(2**i) for i in range(4)]
-                    answer=nums[-1]*2
-            elif difficulty=="hard":
-                start_num=random.randint(2,10)
-                if random.choice([True,False]):
-                    step=random.randint(3,10)
-                    nums=[start_num+i*step for i in range(4)]
-                    answer=nums[-1]+step
-                else:
-                    nums=[start_num*(2**i) for i in range(4)]
-                    answer=nums[-1]*2
-            else:
-                start_num=random.randint(2,10)
-                if random.choice([True,False]):
-                    multiplier=random.choice([2,3,4])
-                    nums=[start_num*(multiplier**i) for i in range(4)]
-                    answer=nums[-1]*multiplier
-                else:
-                    step=random.randint(10,30)
-                    nums=[start_num+i*step for i in range(4)]
-                    answer=nums[-1]+step
-            text=f"{nums[0]}, {nums[1]}, {nums[2]}, {nums[3]}, ?"
+    attempts=0
+    while len(bank)<15 and attempts<1000:
+        attempts+=1
+        text,answer=generate_one_question(selected_grade)
         if text in seen:
             continue
         seen.add(text)
-        choices={answer}
-        spread=max(2,abs(answer)//5)
-        while len(choices)<4:
-            wrong=answer+random.randint(-spread,spread)
-            if wrong!=answer and wrong>=0:
-                choices.add(wrong)
-        choices=list(choices)
-        random.shuffle(choices)
-        bank.append((text,[str(c) for c in choices],choices.index(answer)))
+        choices,correct_index=make_answer_choices(answer)
+        bank.append((text,choices,correct_index))
     return bank
 def get_questions(difficulty,subject):
-    if difficulty not in QUESTIONS:
-        QUESTIONS[difficulty]={}
-    if subject not in QUESTIONS[difficulty]:
-        QUESTIONS[difficulty][subject]=generate_question_bank(difficulty,subject)
-    return QUESTIONS[difficulty][subject]
+    grade_key=str(selected_grade)
+    if grade_key not in QUESTIONS:
+        QUESTIONS[grade_key]={}
+    if difficulty not in QUESTIONS[grade_key]:
+        QUESTIONS[grade_key][difficulty]={}
+    if subject not in QUESTIONS[grade_key][difficulty]:
+        QUESTIONS[grade_key][difficulty][subject]=generate_question_bank(difficulty,subject)
+    return QUESTIONS[grade_key][difficulty][subject]
 class Button:
     def __init__(self,x,y,width,height,text):
         self.rect=pygame.Rect(x,y,width,height)
@@ -146,14 +306,13 @@ class Button:
             rect=text.get_rect(center=(self.rect.centerx,start_y+i*25))
             screen.blit(text,rect)
     def clicked(self,event):
-        """Accept desktop mouse clicks and mobile touchscreen taps."""
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            return event.button == 1 and self.rect.collidepoint(event.pos)
+        # Browser touch input may arrive as FINGERDOWN or a synthesized mouse click.
         if event.type == pygame.FINGERDOWN:
-            # Pygame finger coordinates are normalized to the range 0..1.
             x = int(event.x * SCREEN_WIDTH)
             y = int(event.y * SCREEN_HEIGHT)
             return self.rect.collidepoint(x, y)
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            return self.rect.collidepoint(event.pos)
         return False
 class Character:
     def __init__(self,hp,strength,defense,image):
@@ -207,7 +366,7 @@ def load_image(path):
         surface=pygame.Surface((120,120))
         surface.fill(GRAY)
         return surface
-player=Character(120,2,2,load_image("images/Knight(128).png"))
+player=Character(120,2,2,load_image("images/Knight(192).png"))
 encounter=0
 def make_enemy(number):
     enemies=[
@@ -220,6 +379,9 @@ def make_enemy(number):
     ]
     return enemies[number]
 slime=make_enemy(encounter)
+title_play_button=Button(300,445,200,60,"Play")
+grade_down_button=Button(160,280,80,55,"-")
+grade_up_button=Button(560,280,80,55,"+")
 intro_continue_button=Button(300,450,200,60,"Continue")
 victory_continue_button=Button(300,400,200,60,"Continue")
 restart_button=Button(300,450,200,60,"Restart")
@@ -232,7 +394,7 @@ answer_buttons=[Button(80,350,280,70,""),Button(440,350,280,70,""),Button(80,440
 hp_button=Button(100,470,180,60,"HP +60")
 strength_button=Button(310,470,180,60,"Strength +2")
 defense_button=Button(520,470,180,60,"Defense +2")
-game_state="INTRO"
+game_state="TITLE"
 battle_over=False
 winner=""
 message="Choose an attack!"
@@ -255,6 +417,16 @@ def draw_text(text,x,y,color=WHITE,size="normal"):
     else:
         surface=font.render(text,True,color)
     screen.blit(surface,(x,y))
+def draw_centered_text(text,center_x,center_y,color=WHITE,size="normal"):
+    if size=="large":
+        selected_font=large_font
+    elif size=="small":
+        selected_font=small_font
+    else:
+        selected_font=font
+    surface=selected_font.render(text,True,color)
+    rect=surface.get_rect(center=(center_x,center_y))
+    screen.blit(surface,rect)
 def draw_hp_bar(x,y,current_hp,max_hp,color):
     width=250
     height=25
@@ -270,6 +442,17 @@ def draw_health():
     draw_text(slime.name.upper(),470,20,RED)
     draw_hp_bar(500,55,slime.hp,slime.max_hp,RED)
     draw_text(f"{slime.hp}/{slime.max_hp}",580,90,size="small")
+def draw_title():
+    screen.fill(BLACK)
+    draw_centered_text("TRIALS AND TROLLS",400,100,RED,"large")
+    draw_centered_text("Choose your math grade",400,205,YELLOW)
+    grade_down_button.draw()
+    grade_up_button.draw()
+    draw_centered_text(f"GRADE {selected_grade}",400,307,GREEN,"large")
+    draw_centered_text("Each grade has its own math topics and difficulty.",400,365,WHITE,"small")
+    draw_centered_text("Grade 1: basic math  |  Grade 12: calculus",400,395,WHITE,"small")
+    draw_centered_text("Choose a grade, then press Play!",400,425,WHITE,"small")
+    title_play_button.draw()
 def draw_intro():
     screen.fill(BLACK)
     draw_text("Trials and Trolls",250,50,RED,"large")
@@ -307,7 +490,7 @@ def draw_battle():
 def draw_question():
     screen.fill(BLACK)
     draw_text("KNOWLEDGE TRIAL",235,40,PURPLE,"large")
-    draw_text(f"Topic: {question_subject.upper()}",300,105,YELLOW,"small")
+    draw_text(f"GRADE {selected_grade} MATH TRIAL",255,105,YELLOW,"small")
     draw_text(f"Attack: {selected_attack}",300,135,WHITE,"small")
     elapsed=(pygame.time.get_ticks()-question_start_time)/1000
     remaining=max(0,QUESTION_TIME_LIMIT-elapsed)
@@ -463,19 +646,62 @@ def player_heal():
     message=f"You healed for {healed} HP!"
     enemy_counterattack()
 def next_enemy():
-    global slime,battle_over,winner,message,game_state
+    global encounter_transition
+    if encounter>=6:
+        global game_state
+        game_state="GAMEOVER"
+        return
+    # Fade the current soundtrack and the current screen to black together.
+    encounter_transition={"phase":"out","start_time":pygame.time.get_ticks()}
+def load_next_enemy():
+    global slime,battle_over,winner,message,game_state,current_music,music_transition
     if encounter>=6:
         game_state="GAMEOVER"
         return
+    # The old track is fully stopped before the new encounter and track begin.
+    if music_channel is not None:
+        music_channel.stop()
+        music_channel.set_volume(0)
+    current_music=None
+    music_transition=None
     slime=make_enemy(encounter)
+    play_enemy_music(encounter)
     battle_over=False
     winner=""
     reset_cooldowns()
     message=f"A {slime.name} appears!"
     game_state="BATTLE"
+def update_encounter_transition():
+    global encounter_transition
+    if encounter_transition is None:
+        return
+    now=pygame.time.get_ticks()
+    progress=min(1,(now-encounter_transition["start_time"])/MUSIC_FADE_MS)
+    if encounter_transition["phase"]=="out":
+        # Screen and soundtrack fade out over the same 1.2-second interval.
+        if music_channel is not None and music_channel.get_busy():
+            music_channel.set_volume(MUSIC_VOLUME*(1-progress))
+        if progress>=1:
+            if music_channel is not None:
+                music_channel.stop()
+            load_next_enemy()
+            encounter_transition={"phase":"in","start_time":now}
+    elif encounter_transition["phase"]=="in" and progress>=1:
+        encounter_transition=None
+def draw_encounter_fade():
+    if encounter_transition is None:
+        return
+    now=pygame.time.get_ticks()
+    progress=min(1,(now-encounter_transition["start_time"])/MUSIC_FADE_MS)
+    alpha=int(255*progress) if encounter_transition["phase"]=="out" else int(255*(1-progress))
+    overlay=pygame.Surface((SCREEN_WIDTH,SCREEN_HEIGHT))
+    overlay.fill(BLACK)
+    overlay.set_alpha(alpha)
+    screen.blit(overlay,(0,0))
 def restart_game():
     global player,slime,encounter,battle_over,winner,message,game_state,QUESTIONS
-    player=Character(120,2,2,load_image("images/Knight(128).png"))
+    stop_music()
+    player=Character(120,2,2,load_image("images/Knight(192).png"))
     encounter=0
     slime=make_enemy(encounter)
     battle_over=False
@@ -483,16 +709,27 @@ def restart_game():
     message="Choose an attack!"
     reset_cooldowns()
     QUESTIONS={}
-    game_state="INTRO"
+    game_state="TITLE"
 async def main():
-    global game_state, message, player
+    global game_state, selected_grade, message
     running=True
     while running:
         for event in pygame.event.get():
             if event.type==pygame.QUIT:
                 running=False
-            if game_state=="INTRO":
+                continue
+            if encounter_transition is not None:
+                continue
+            if game_state=="TITLE":
+                if grade_down_button.clicked(event):
+                    selected_grade=max(1,selected_grade-1)
+                elif grade_up_button.clicked(event):
+                    selected_grade=min(12,selected_grade+1)
+                elif title_play_button.clicked(event):
+                    game_state="INTRO"
+            elif game_state=="INTRO":
                 if intro_continue_button.clicked(event):
+                    play_enemy_music(encounter)
                     game_state="BATTLE"
                     message="Choose an attack!"
             elif game_state=="BATTLE":
@@ -516,9 +753,7 @@ async def main():
                         else:
                             next_enemy()
             elif game_state=="QUESTION":
-                if question_time_expired() and not question_locked:
-                    answer_question(-1)
-                elif not question_locked:
+                if not question_locked:
                     for i,button in enumerate(answer_buttons):
                         if button.clicked(event):
                             answer_question(i)
@@ -540,7 +775,11 @@ async def main():
                     restart_game()
         if game_state=="QUESTION" and not question_locked and question_time_expired():
             answer_question(-1)
-        if game_state=="INTRO":
+        update_music_transition()
+        update_encounter_transition()
+        if game_state=="TITLE":
+            draw_title()
+        elif game_state=="INTRO":
             draw_intro()
         elif game_state=="BATTLE":
             draw_battle()
@@ -550,9 +789,11 @@ async def main():
             draw_levelup()
         elif game_state=="GAMEOVER":
             draw_gameover()
+        draw_encounter_fade()
         pygame.display.flip()
         clock.tick(60)
         await asyncio.sleep(0)
     pygame.quit()
+    # Return cleanly instead of exiting the browser interpreter.
 
 asyncio.run(main())
