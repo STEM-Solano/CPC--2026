@@ -306,14 +306,12 @@ class Button:
             rect=text.get_rect(center=(self.rect.centerx,start_y+i*25))
             screen.blit(text,rect)
     def clicked(self,event):
-        # Browser touch input may arrive as FINGERDOWN or a synthesized mouse click.
-        if event.type == pygame.FINGERDOWN:
-            x = int(event.x * SCREEN_WIDTH)
-            y = int(event.y * SCREEN_HEIGHT)
-            return self.rect.collidepoint(x, y)
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            return self.rect.collidepoint(event.pos)
-        return False
+        # The event loop normalizes both finger and mouse events into
+        # MOUSEBUTTONDOWN with coordinates in the 800x600 game surface.
+        return (event.type == pygame.MOUSEBUTTONDOWN
+                and getattr(event, "button", None) == 1
+                and self.rect.collidepoint(event.pos))
+
 class Character:
     def __init__(self,hp,strength,defense,image):
         self.max_hp=hp
@@ -710,6 +708,46 @@ def restart_game():
     reset_cooldowns()
     QUESTIONS={}
     game_state="TITLE"
+# Mobile input adapter. Safari/Pygbag may deliver FINGERDOWN, FINGERUP,
+# MOUSEBUTTONDOWN, or a synthetic mouse event for the same physical tap.
+# Convert each physical tap into one game-space mouse click.
+_last_pointer_ms = -10000
+_last_pointer_pos = (-1000, -1000)
+_touch_debug = None
+
+def mobile_click_event(event):
+    global _last_pointer_ms, _last_pointer_pos, _touch_debug
+    is_finger = event.type in (pygame.FINGERDOWN, pygame.FINGERUP)
+    is_mouse = event.type == pygame.MOUSEBUTTONDOWN and getattr(event, "button", 0) == 1
+    if not (is_finger or is_mouse):
+        return None
+
+    if is_finger:
+        # SDL finger coordinates are normalized from 0 to 1.
+        x = round(event.x * SCREEN_WIDTH)
+        y = round(event.y * SCREEN_HEIGHT)
+    else:
+        x, y = event.pos
+        # Normally pygame already maps browser coordinates to its canvas.
+        # Account for a differently sized display surface if one is used.
+        actual_width, actual_height = screen.get_size()
+        if (actual_width, actual_height) != (SCREEN_WIDTH, SCREEN_HEIGHT):
+            x = round(x * SCREEN_WIDTH / actual_width)
+            y = round(y * SCREEN_HEIGHT / actual_height)
+
+    now = pygame.time.get_ticks()
+    # Ignore synthesized duplicate mouse events and the finger-up following
+    # a finger-down, but allow rapid taps at different button positions.
+    if (now - _last_pointer_ms < 350 and
+            abs(x - _last_pointer_pos[0]) < 32 and
+            abs(y - _last_pointer_pos[1]) < 32):
+        return None
+    _last_pointer_ms = now
+    _last_pointer_pos = (x, y)
+    _touch_debug = (x, y, now)
+    print(f"Input: {'finger' if is_finger else 'mouse'} at ({x}, {y}) state={game_state}")
+    return pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"button": 1, "pos": (x, y)})
+
 async def main():
     global game_state, selected_grade, message
     running=True
@@ -719,6 +757,9 @@ async def main():
                 running=False
                 continue
             if encounter_transition is not None:
+                continue
+            event = mobile_click_event(event)
+            if event is None:
                 continue
             if game_state=="TITLE":
                 if grade_down_button.clicked(event):
@@ -790,6 +831,11 @@ async def main():
         elif game_state=="GAMEOVER":
             draw_gameover()
         draw_encounter_fade()
+        # Small temporary marker: green = tap reached Python game code.
+        if _touch_debug is not None:
+            tx, ty, tap_time = _touch_debug
+            if pygame.time.get_ticks() - tap_time < 650:
+                pygame.draw.circle(screen, (50, 255, 100), (tx, ty), 9, 2)
         pygame.display.flip()
         clock.tick(60)
         await asyncio.sleep(0)
